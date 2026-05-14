@@ -1,0 +1,10 @@
+.env
+*.session
+__pycache__/
+*.pyc
+.git/
+.gitignore
+DEPLOY.md
+SETUP_CLAUDE_DESKTOP_MCP.md
+n8n_oficina.py
+.env.example

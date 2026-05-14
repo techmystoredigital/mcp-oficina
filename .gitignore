@@ -1,0 +1,12 @@
+.env
+*.session
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Archivos del MCP stdio viejo (no son parte de este deploy)
+SETUP_CLAUDE_DESKTOP_MCP.md
+n8n_oficina.py
