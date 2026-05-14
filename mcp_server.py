@@ -572,3 +572,4 @@ def make_app() -> Starlette:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(make_app(), host="0.0.0.0", port=PORT, log_level="info", proxy_headers=True, forwarded_allow_ips="*")
+
