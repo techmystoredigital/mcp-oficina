@@ -45,6 +45,7 @@ from mcp.types import Tool, TextContent
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
@@ -545,7 +546,26 @@ def make_app() -> Starlette:
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
             Mount("/messages/", app=sse_transport.handle_post_message),
         ],
-        middleware=[Middleware(AuthMiddleware)],
+        middleware=[
+            # CORS primero (responde a preflight OPTIONS y agrega headers a las respuestas)
+            Middleware(
+                CORSMiddleware,
+                allow_origins=[
+                    "https://claude.ai",
+                    "https://*.claude.ai",
+                    "https://api.anthropic.com",
+                    "https://console.anthropic.com",
+                    "https://platform.claude.com",
+                ],
+                allow_origin_regex=r"https://([a-z0-9-]+\.)*(claude\.ai|anthropic\.com|claude\.com)",
+                allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
+                allow_headers=["*"],
+                allow_credentials=True,
+                expose_headers=["WWW-Authenticate", "Mcp-Session-Id"],
+                max_age=86400,
+            ),
+            Middleware(AuthMiddleware),
+        ],
     )
 
 
