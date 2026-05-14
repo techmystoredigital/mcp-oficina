@@ -146,13 +146,13 @@ MCP_BEARER_TOKEN=<token generado abajo>
 PORT=8080
 ```
 
-**Token Bearer generado para esta instalación** (guardalo, lo vas a usar también en Claude):
+**Token Bearer**: generar uno único para tu instalación (mismo token va en EasyPanel y en la config de Claude):
 
-```
-RcdVFIGroBICFM3bkKC0dUFg1AGoXGy-qJyRqak5LZodydjdAwb076ewgZ0FINoa
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-(Si querés generar otro, usá: `python -c "import secrets; print(secrets.token_urlsafe(48))"`)
+Copialo y pegalo en la env var `MCP_BEARER_TOKEN`. **Nunca lo subas a Git.**
 
 ### 3.5 Recursos (Settings → Resources)
 
@@ -212,15 +212,15 @@ curl -i -H "Authorization: Bearer RcdVFIGroBICFM3bkKC0dUFg1AGoXGy-qJyRqak5LZodyd
 
 Ubicación: `%APPDATA%\Claude\claude_desktop_config.json`
 
-Agregar dentro de `"mcpServers"`:
+Agregar dentro de `"mcpServers"` (reemplazá `<TOKEN>` por el bearer real):
 
 ```json
 {
   "mcpServers": {
     "n8n-oficina": {
-      "url": "https://mcp.yoanyandres.one/sse",
+      "url": "https://<TU-DOMINIO-MCP>/sse",
       "headers": {
-        "Authorization": "Bearer RcdVFIGroBICFM3bkKC0dUFg1AGoXGy-qJyRqak5LZodydjdAwb076ewgZ0FINoa"
+        "Authorization": "Bearer <TOKEN>"
       }
     }
   }
