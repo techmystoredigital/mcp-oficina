@@ -14,6 +14,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Código
 COPY mcp_server.py .
 
+# Carpeta para la DB persistente (SQLite con OAuth clients/tokens).
+# EasyPanel debe montar un volumen acá para que sobreviva a reconstrucciones del contenedor.
+# Si no hay volumen montado, el código tiene fallback a ./oauth.db (NO persistente).
+RUN mkdir -p /data
+VOLUME ["/data"]
+
 # Puerto que expone el servidor
 EXPOSE 8080
 

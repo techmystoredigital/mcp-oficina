@@ -1,4 +1,4 @@
-"""Servidor MCP HTTP para que Claude (Desktop, Web, Mobile) controle N8N de Mine Store.
+"""Servidor MCP HTTP para que Claude (Desktop, Web, Mobile) controle N8N de My Store Digital.
 
 Soporta DOS modos de autenticación:
 - **Bearer token fijo** (para Claude Desktop / Claude Code CLI): se envia en el header
@@ -34,7 +34,9 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -257,11 +259,127 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
 
 # =========================================================================
 # OAuth 2.1 + DCR + PKCE
-# Storage in-memory: si el contenedor reinicia, los clients se vuelven a registrar automaticamente
+# Storage: SQLite persistente. Se guarda en /data/oauth.db (volumen Docker montado en EasyPanel).
+# Si /data no es escribible (ej. dev local sin volumen), fallback a ./oauth.db al lado del script.
+# Los access tokens NO expiran (vida útil indefinida hasta revocación manual o cambio de password OAuth).
+# Los auth codes mantienen TTL de 5 min (security best practice, no afecta UX).
 # =========================================================================
-_oauth_clients: dict[str, dict] = {}        # client_id -> {redirect_uris, ...}
-_oauth_auth_codes: dict[str, dict] = {}     # code -> {client_id, code_challenge, redirect_uri, expires_at}
-_oauth_access_tokens: dict[str, dict] = {}  # access_token -> {client_id, expires_at}
+OAUTH_DB_PATH = os.environ.get("OAUTH_DB_PATH", "/data/oauth.db")
+
+
+def _resolve_db_path() -> str:
+    """Devuelve la ruta efectiva de la DB. Si la preferida no es escribible, usa fallback local."""
+    preferred = Path(OAUTH_DB_PATH)
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        # Probar escritura real
+        test = preferred.parent / ".write_test"
+        test.write_text("ok")
+        test.unlink()
+        return str(preferred)
+    except (OSError, PermissionError):
+        fallback = Path(__file__).resolve().parent / "oauth.db"
+        return str(fallback)
+
+
+_DB_PATH = _resolve_db_path()
+
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(_DB_PATH, timeout=10.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+
+def _db_init() -> None:
+    """Crea las tablas si no existen. Idempotente."""
+    with _db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id     TEXT PRIMARY KEY,
+                client_name   TEXT,
+                redirect_uris TEXT,
+                issued_at     INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+                code                  TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                code_challenge        TEXT NOT NULL,
+                code_challenge_method TEXT NOT NULL,
+                redirect_uri          TEXT NOT NULL,
+                expires_at            REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+                access_token TEXT PRIMARY KEY,
+                client_id    TEXT NOT NULL,
+                created_at   REAL NOT NULL
+            );
+            """
+        )
+
+
+# ---- Helpers de acceso a la DB ----
+def _client_insert(client_id: str, client_name: str, redirect_uris: list, issued_at: int) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, issued_at) VALUES (?, ?, ?, ?)",
+            (client_id, client_name, json.dumps(redirect_uris), issued_at),
+        )
+
+
+def _client_exists(client_id: str) -> bool:
+    with _db() as conn:
+        row = conn.execute("SELECT 1 FROM oauth_clients WHERE client_id = ?", (client_id,)).fetchone()
+        return row is not None
+
+
+def _code_insert(code: str, client_id: str, code_challenge: str, method: str, redirect_uri: str, expires_at: float) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO oauth_auth_codes (code, client_id, code_challenge, code_challenge_method, redirect_uri, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (code, client_id, code_challenge, method, redirect_uri, expires_at),
+        )
+
+
+def _code_pop(code: str) -> dict | None:
+    """Devuelve el code y lo elimina (one-time use). None si no existe."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM oauth_auth_codes WHERE code = ?", (code,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM oauth_auth_codes WHERE code = ?", (code,))
+        return dict(row)
+
+
+def _token_insert(access_token: str, client_id: str) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO oauth_access_tokens (access_token, client_id, created_at) VALUES (?, ?, ?)",
+            (access_token, client_id, time.time()),
+        )
+
+
+def _token_exists(access_token: str) -> bool:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM oauth_access_tokens WHERE access_token = ?", (access_token,)
+        ).fetchone()
+        return row is not None
+
+
+def _count_clients() -> int:
+    with _db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM oauth_clients").fetchone()[0]
+
+
+def _count_tokens() -> int:
+    with _db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM oauth_access_tokens").fetchone()[0]
+
+
+_db_init()
 
 
 def _get_base_url(request: Request) -> str:
@@ -297,14 +415,16 @@ async def oauth_register(request: Request):
     except Exception:
         body = {}
     client_id = secrets.token_urlsafe(16)
-    _oauth_clients[client_id] = {
-        "redirect_uris": body.get("redirect_uris", []),
-        "client_name": body.get("client_name", "unknown"),
-        "issued_at": int(time.time()),
-    }
+    issued_at = int(time.time())
+    _client_insert(
+        client_id=client_id,
+        client_name=body.get("client_name", "unknown"),
+        redirect_uris=body.get("redirect_uris", []),
+        issued_at=issued_at,
+    )
     return JSONResponse({
         "client_id": client_id,
-        "client_id_issued_at": _oauth_clients[client_id]["issued_at"],
+        "client_id_issued_at": issued_at,
         "redirect_uris": body.get("redirect_uris", []),
         "client_name": body.get("client_name", "MCP Client"),
         "token_endpoint_auth_method": "none",
@@ -321,7 +441,7 @@ def _auth_form_html(client_id: str, redirect_uri: str, code_challenge: str,
     err_html = f'<p style="color:#ff6b6b;background:#3a1818;padding:10px;border-radius:6px;">{error}</p>' if error else ""
     return f"""<!doctype html>
 <html lang="es"><head><meta charset="utf-8"/>
-<title>Aprobar acceso MCP — Mine Store</title>
+<title>Aprobar acceso MCP — My Store Digital</title>
 <style>
 body {{ font-family: sans-serif; background: #1a1d24; color: #e6e8eb; max-width: 460px; margin: 50px auto; padding: 30px; border: 1px solid #374151; border-radius: 12px; }}
 h1 {{ font-size: 22px; color: #4ade80; }}
@@ -334,7 +454,7 @@ button:hover {{ background: #22c55e; }}
 .help {{ font-size: 12px; color: #94a3b8; margin-top: 14px; }}
 </style></head><body>
 <h1>🔐 Aprobar acceso al MCP</h1>
-<p>Un cliente quiere conectarse al servidor MCP de <strong>Mine Store Digital</strong>.</p>
+<p>Un cliente quiere conectarse al servidor MCP de <strong>My Store Digital</strong>.</p>
 <div class="client">Cliente: <code>{safe_client}</code></div>
 {err_html}
 <form method="POST" action="/authorize">
@@ -367,7 +487,7 @@ async def oauth_authorize_get(request: Request):
 
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
-    if not client_id or client_id not in _oauth_clients:
+    if not client_id or not _client_exists(client_id):
         return JSONResponse({"error": "invalid_client", "msg": f"client_id desconocido: {client_id}"}, status_code=400)
     if not code_challenge or method != "S256":
         return JSONResponse({"error": "invalid_request", "msg": "Se requiere PKCE S256"}, status_code=400)
@@ -392,13 +512,14 @@ async def oauth_authorize_post(request: Request):
         return HTMLResponse(html, status_code=401)
 
     code = secrets.token_urlsafe(32)
-    _oauth_auth_codes[code] = {
-        "client_id": client_id,
-        "code_challenge": code_challenge,
-        "code_challenge_method": method,
-        "redirect_uri": redirect_uri,
-        "expires_at": time.time() + 300,  # 5 min
-    }
+    _code_insert(
+        code=code,
+        client_id=client_id,
+        code_challenge=code_challenge,
+        method=method,
+        redirect_uri=redirect_uri,
+        expires_at=time.time() + 300,  # 5 min, sigue siendo TTL corto por seguridad
+    )
 
     params = {"code": code}
     if state:
@@ -423,7 +544,8 @@ async def oauth_token(request: Request):
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    auth = _oauth_auth_codes.get(code)
+    # _code_pop hace SELECT + DELETE atómico (one-time use garantizado)
+    auth = _code_pop(code)
     if not auth or auth["expires_at"] < time.time():
         return JSONResponse({"error": "invalid_grant", "msg": "code invalido o expirado"}, status_code=400)
     if client_id and client_id != auth["client_id"]:
@@ -439,31 +561,26 @@ async def oauth_token(request: Request):
     else:
         return JSONResponse({"error": "invalid_grant", "msg": "Solo S256 soportado"}, status_code=400)
 
-    # One-time use
-    del _oauth_auth_codes[code]
-
     access_token = secrets.token_urlsafe(32)
-    _oauth_access_tokens[access_token] = {
-        "client_id": auth["client_id"],
-        "expires_at": time.time() + 86400 * 30,  # 30 días
-    }
+    _token_insert(access_token=access_token, client_id=auth["client_id"])
 
+    # Los tokens NO expiran. Se invalidan solo borrando la fila o cambiando MCP_AUTH_PASSWORD
+    # (los tokens viejos siguen siendo válidos, pero conexiones nuevas requieren el password nuevo).
+    # Devolvemos un expires_in alto para cumplir con clientes OAuth estrictos que esperan el campo.
+    NEVER_EXPIRES = 86400 * 365 * 100  # 100 años — efectivamente permanente
     return JSONResponse({
         "access_token": access_token,
         "token_type": "Bearer",
-        "expires_in": 86400 * 30,
+        "expires_in": NEVER_EXPIRES,
         "scope": "mcp",
     })
 
 
 def _is_token_valid(token: str) -> bool:
-    """Verifica si un token es válido: Bearer fijo o OAuth issued."""
+    """Verifica si un token es válido: Bearer fijo o OAuth issued (vida permanente)."""
     if MCP_BEARER_TOKEN and token == MCP_BEARER_TOKEN:
         return True
-    t = _oauth_access_tokens.get(token)
-    if t and t["expires_at"] > time.time():
-        return True
-    return False
+    return _token_exists(token)
 
 
 # =========================================================================
@@ -515,8 +632,10 @@ async def healthz(request: Request):
         "has_api_key": bool(N8N_API_KEY),
         "has_bearer": bool(MCP_BEARER_TOKEN),
         "has_oauth": bool(MCP_AUTH_PASSWORD),
-        "clients_registered": len(_oauth_clients),
-        "active_tokens": sum(1 for t in _oauth_access_tokens.values() if t["expires_at"] > time.time()),
+        "clients_registered": _count_clients(),
+        "active_tokens": _count_tokens(),
+        "db_path": _DB_PATH,
+        "db_persistent": _DB_PATH.startswith("/data/"),
     })
 
 
