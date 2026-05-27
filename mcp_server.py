@@ -114,9 +114,14 @@ async def list_tools() -> list[Tool]:
         Tool(name="estado_sistema",
              description="Consulta el estado del sistema de conciliacion (metricas, salud).",
              inputSchema={"type": "object", "properties": {}, "required": []}),
-        Tool(name="procesar_dia",
-             description="Dispara MASTER (Scripts 1+2+3). Tarda 1-3 min. Genera paso1/2/3 en OUTPUTS.",
+        Tool(name="previsualizar_fechas",
+             description="Lee las cajas Virtualsoft y el Yopago SIN procesar nada. Devuelve: fechas detectadas en las cajas (con cantidad y monto), fechas_sugeridas (nuevas, posteriores a la ultima del Yopago), fechas_ya_procesadas, ultima_fecha_yopago y dia_actual. Usar SIEMPRE antes de procesar para mostrar a Grecia que fechas se procesarian y que ella confirme.",
              inputSchema={"type": "object", "properties": {}, "required": []}),
+        Tool(name="procesar_dia",
+             description="Dispara MASTER (Scripts 1+2+3). Tarda 1-3 min. Genera paso1/2/3 en OUTPUTS. Parametro opcional fechas_a_procesar (lista YYYY-MM-DD): si se pasa, procesa SOLO esas fechas (control manual); si se omite, procesa automaticamente todas las posteriores a la ultima fecha del Yopago.",
+             inputSchema={"type": "object", "properties": {
+                 "fechas_a_procesar": {"type": "array", "items": {"type": "string"},
+                     "description": "Lista de fechas YYYY-MM-DD a procesar. Opcional; omitir = modo automatico."}}, "required": []}),
         Tool(name="cerrar_dia",
              description="Dispara Workflow D (genera paso4). Cruza paso3 con chat. Opcional: chat_data del parser.",
              inputSchema={"type": "object", "properties": {
@@ -172,9 +177,16 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
     try:
         if name == "estado_sistema":
             return [TextContent(type="text", text=await n8n_webhook("estado-bot", method="GET"))]
+        if name == "previsualizar_fechas":
+            return [TextContent(type="text", text=await n8n_webhook("previsualizar-fechas"))]
         if name == "procesar_dia":
-            r = await n8n_webhook("exec-master-procesar")
-            return [TextContent(type="text", text=f"MASTER disparado.\n{r}\n\nVerifica OUTPUTS en 2-5 min.")]
+            body = {}
+            fechas = arguments.get("fechas_a_procesar")
+            if fechas:
+                body["fechas_a_procesar"] = fechas
+            r = await n8n_webhook("exec-master-procesar", body)
+            extra = f" (fechas elegidas: {', '.join(fechas)})" if fechas else " (modo automatico: posteriores a la ultima del Yopago)"
+            return [TextContent(type="text", text=f"MASTER disparado{extra}.\n{r}\n\nVerifica OUTPUTS en 2-5 min.")]
         if name == "cerrar_dia":
             body = {"chat_data": arguments["chat_data"]} if arguments.get("chat_data") else {}
             return [TextContent(type="text", text=f"Workflow D disparado.\n{await n8n_webhook('exec-script4', body)}")]
