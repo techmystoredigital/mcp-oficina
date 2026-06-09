@@ -140,6 +140,11 @@ async def list_tools() -> list[Tool]:
              description="Dispara Conciliacion_Telegram con chat_data (lista de transacciones).",
              inputSchema={"type": "object", "properties": {
                  "chat_data": {"type": "array", "items": {"type": "object"}}}, "required": ["chat_data"]}),
+        Tool(name="conciliar_whatsapp",
+             description="2da automatizacion: concilia por WhatsApp. Lee el puntero del ultimo run de Scripts (_ultimo_run.json), baja el paso3, captura el chat de WhatsApp UNA vez (/api/state), lee los recibos con Vision (Gemini) y genera 'paso4_whatsapp' (Yopago final conciliado) en la carpeta del dia. Correr DESPUES de procesar_dia. Tarda 1-3 min. Solo llena con certeza (regla de oro); lo dudoso queda en blanco y se reporta.",
+             inputSchema={"type": "object", "properties": {
+                 "fechas": {"type": "array", "items": {"type": "string"},
+                     "description": "Opcional: lista de fechas YYYY-MM-DD a conciliar. Omitir = todas las pendientes del paso3."}}, "required": []}),
         Tool(name="listar_workflows",
              description="Lista todos los workflows de N8N.",
              inputSchema={"type": "object", "properties": {
@@ -202,6 +207,12 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
         if name == "conciliar_telegram":
             return [TextContent(type="text", text=await n8n_webhook("exec-conciliacion-telegram",
                                                                       {"chat_data": arguments["chat_data"]}))]
+        if name == "conciliar_whatsapp":
+            body = {}
+            if arguments.get("fechas"):
+                body["fechas"] = arguments["fechas"]
+            r = await n8n_webhook("conciliar-whatsapp", body)
+            return [TextContent(type="text", text=f"Conciliacion WhatsApp disparada (genera paso4_whatsapp).\n{r}")]
         if name == "listar_workflows":
             data = await n8n_api_get("/workflows?limit=200")
             wfs = data.get("data", [])
