@@ -57,6 +57,11 @@ from starlette.routing import Mount, Route
 # =========================================================================
 N8N_BASE = os.environ.get("N8N_BASE", "https://n8n.yoanyandres.one").rstrip("/")
 N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
+# Operador (donde corre el webhook de visión) — para contar recibos leídos en vivo (progreso_whatsapp)
+OP_N8N_BASE = os.environ.get("OP_N8N_BASE", "https://n8n.yoanyandres.one").rstrip("/")
+OP_N8N_KEY = os.environ.get("OP_N8N_KEY", "")
+VISION_WF_ID = os.environ.get("VISION_WF_ID", "EOawUwsoGf94R3OE")
+CONCILIAR_WF_ID = os.environ.get("CONCILIAR_WF_ID", "M98V0iDysrLyhFfL")
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_AUTH_PASSWORD = os.environ.get("MCP_AUTH_PASSWORD", "")
 MCP_PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
@@ -90,6 +95,16 @@ async def n8n_api_post(path: str, body: dict | None = None) -> dict:
             json=body or {},
         )
         return {"status": r.status_code, "body": r.text[:2000]}
+
+
+async def op_api_get(path: str) -> dict:
+    """GET a la N8N del operador (para progreso: contar ejecuciones del webhook de visión)."""
+    if not OP_N8N_KEY:
+        return {}
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, verify=True) as c:
+        r = await c.get(f"{OP_N8N_BASE}/api/v1{path}", headers={"X-N8N-API-KEY": OP_N8N_KEY})
+        r.raise_for_status()
+        return r.json()
 
 
 async def n8n_webhook(path: str, body: dict | None = None, method: str = "POST") -> str:
@@ -145,6 +160,9 @@ async def list_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": {
                  "fechas": {"type": "array", "items": {"type": "string"},
                      "description": "Opcional: lista de fechas YYYY-MM-DD a conciliar. Omitir = todas las pendientes del paso3."}}, "required": []}),
+        Tool(name="progreso_whatsapp",
+             description="Consulta el AVANCE de la conciliacion WhatsApp en curso: estado (corriendo/termino/error), recibos leidos en los ultimos minutos y errores recientes. Usar DESPUES de conciliar_whatsapp, repetidamente cada ~30s, para reportar el progreso al usuario hasta que termine.",
+             inputSchema={"type": "object", "properties": {}, "required": []}),
         Tool(name="listar_workflows",
              description="Lista todos los workflows de N8N.",
              inputSchema={"type": "object", "properties": {
@@ -212,7 +230,41 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
             if arguments.get("fechas"):
                 body["fechas"] = arguments["fechas"]
             r = await n8n_webhook("conciliar-whatsapp", body)
-            return [TextContent(type="text", text=f"Conciliacion WhatsApp disparada (genera paso4_whatsapp).\n{r}")]
+            return [TextContent(type="text", text="Conciliacion WhatsApp INICIADA en segundo plano. Consulta 'progreso_whatsapp' cada ~30s para ver el avance (recibos leidos / estado / errores). El paso4 y Recibos_Leidos.xlsx quedan en OUTPUTS al terminar.\n" + r)]
+        if name == "progreso_whatsapp":
+            import datetime as _dt
+            cdata = await n8n_api_get(f"/executions?workflowId={CONCILIAR_WF_ID}&limit=1")
+            cex = cdata.get("data") or []
+            estado, corriendo = "sin ejecuciones", False
+            if cex:
+                e = cex[0]; st = e.get("status", "?")
+                corriendo = (st == "running") or (not e.get("stoppedAt"))
+                estado = ("CORRIENDO desde " + str(e.get("startedAt", ""))[11:19] + "Z") if corriendo else (str(st).upper() + " (fin " + str(e.get("stoppedAt", ""))[11:19] + "Z)")
+            recibos = None
+            if OP_N8N_KEY:
+                try:
+                    vdata = await op_api_get(f"/executions?workflowId={VISION_WF_ID}&limit=250")
+                    now = _dt.datetime.now(_dt.timezone.utc); cnt = 0
+                    for e in (vdata.get("data") or []):
+                        t = e.get("startedAt")
+                        if t:
+                            try:
+                                d = _dt.datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+                                if (now - d).total_seconds() <= 40 * 60:
+                                    cnt += 1
+                            except Exception:
+                                pass
+                    recibos = cnt
+                except Exception:
+                    recibos = None
+            edata = await n8n_api_get(f"/executions?workflowId={CONCILIAR_WF_ID}&status=error&limit=3")
+            errs = len(edata.get("data") or [])
+            txt = f"Conciliacion WhatsApp: {estado}. "
+            if recibos is not None:
+                txt += f"Recibos leidos (ult. 40 min): {recibos}. "
+            txt += f"Errores recientes: {errs}."
+            payload = {"estado": estado, "corriendo": corriendo, "recibos_leidos_40min": recibos, "errores_recientes": errs}
+            return [TextContent(type="text", text=txt + "\n" + json.dumps(payload, ensure_ascii=False))]
         if name == "listar_workflows":
             data = await n8n_api_get("/workflows?limit=200")
             wfs = data.get("data", [])
