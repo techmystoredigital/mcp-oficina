@@ -161,7 +161,7 @@ async def list_tools() -> list[Tool]:
                  "fechas": {"type": "array", "items": {"type": "string"},
                      "description": "Opcional: lista de fechas YYYY-MM-DD a conciliar. Omitir = todas las pendientes del paso3."}}, "required": []}),
         Tool(name="progreso_whatsapp",
-             description="Consulta el AVANCE de la conciliacion WhatsApp en curso: estado (corriendo/termino/error), recibos leidos en los ultimos minutos y errores recientes. Usar DESPUES de conciliar_whatsapp, repetidamente cada ~30s, para reportar el progreso al usuario hasta que termine.",
+             description="Consulta el RESULTADO REAL de la conciliacion WhatsApp. Devuelve: estado (CORRIENDO / PROCESANDO EN TANDAS / COMPLETO), conciliadas_total (recargas efectivamente conciliadas, ACUMULADO del dia), para_revision_manual (las que quedan sin recibo claro), completo (true/false) y un veredicto en texto. Usar DESPUES de conciliar_whatsapp, cada ~30-60s, hasta que 'completo'=true. IMPORTANTE: para reportar al usuario usa SIEMPRE 'conciliadas_total' y 'para_revision_manual'. El campo 'lecturas_nuevas_gemini_40min' es informativo y puede ser 0 por cache; NO significa que se conciliaron 0 recargas.",
              inputSchema={"type": "object", "properties": {}, "required": []}),
         Tool(name="listar_workflows",
              description="Lista todos los workflows de N8N.",
@@ -233,37 +233,102 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
             return [TextContent(type="text", text="Conciliacion WhatsApp INICIADA en segundo plano. Consulta 'progreso_whatsapp' cada ~30s para ver el avance (recibos leidos / estado / errores). El paso4 y Recibos_Leidos.xlsx quedan en OUTPUTS al terminar.\n" + r)]
         if name == "progreso_whatsapp":
             import datetime as _dt
-            cdata = await n8n_api_get(f"/executions?workflowId={CONCILIAR_WF_ID}&limit=1")
+
+            def _conciliar_out(execjson: dict):
+                """Extrae el json de salida del nodo 'Conciliar' de una ejecucion."""
+                d = execjson.get("data")
+                if isinstance(d, str):
+                    try:
+                        d = json.loads(d)
+                    except Exception:
+                        return None
+                try:
+                    arr = (((d or {}).get("resultData") or {}).get("runData") or {}).get("Conciliar") or []
+                    return arr[-1]["data"]["main"][0][0]["json"]
+                except Exception:
+                    return None
+
+            # Ultimas ejecuciones de la conciliacion (la cadena de auto-continuacion del dia)
+            cdata = await n8n_api_get(f"/executions?workflowId={CONCILIAR_WF_ID}&limit=30")
             cex = cdata.get("data") or []
-            estado, corriendo = "sin ejecuciones", False
-            if cex:
-                e = cex[0]; st = e.get("status", "?")
-                corriendo = (st == "running") or (not e.get("stoppedAt"))
-                estado = ("CORRIENDO desde " + str(e.get("startedAt", ""))[11:19] + "Z") if corriendo else (str(st).upper() + " (fin " + str(e.get("stoppedAt", ""))[11:19] + "Z)")
+            corriendo = any((e.get("status") == "running") or (not e.get("stoppedAt")) for e in cex[:3])
+            now = _dt.datetime.now(_dt.timezone.utc)
+
+            def _mins_ago(e):
+                t = e.get("startedAt")
+                if not t:
+                    return 9999
+                try:
+                    return (now - _dt.datetime.fromisoformat(str(t).replace("Z", "+00:00"))).total_seconds() / 60.0
+                except Exception:
+                    return 9999
+
+            # Cadena del dia = ejecuciones terminadas en las ultimas 2 horas (cubre dias con muchas tandas en API gratis)
+            chain = [e for e in cex if e.get("status") in ("success", "error") and _mins_ago(e) <= 120]
+            conciliadas_total = 0          # suma de 'escritas' de la cadena (acumulado del dia)
+            a_revisar = None               # pendientes sin resolver en la ultima tanda
+            incompleto = None              # ¿quedo trabajo pendiente?
+            ultima_out = None
+            for e in chain:
+                try:
+                    full = await n8n_api_get(f"/executions/{e.get('id')}?includeData=true")
+                    out = _conciliar_out(full)
+                except Exception:
+                    out = None
+                if not out:
+                    continue
+                conciliadas_total += int(out.get("escritas") or 0)
+                if ultima_out is None:  # chain viene ordenada de mas reciente a mas vieja
+                    ultima_out = out
+                    a_revisar = out.get("a_revisar")
+                    incompleto = bool(out.get("incompleto"))
+
+            # Recibos nuevos leidos por Gemini en la ventana (NO es el total conciliado)
             recibos = None
             if OP_N8N_KEY:
                 try:
                     vdata = await op_api_get(f"/executions?workflowId={VISION_WF_ID}&limit=250")
-                    now = _dt.datetime.now(_dt.timezone.utc); cnt = 0
+                    cnt = 0
                     for e in (vdata.get("data") or []):
-                        t = e.get("startedAt")
-                        if t:
-                            try:
-                                d = _dt.datetime.fromisoformat(str(t).replace("Z", "+00:00"))
-                                if (now - d).total_seconds() <= 40 * 60:
-                                    cnt += 1
-                            except Exception:
-                                pass
+                        if _mins_ago(e) <= 40:
+                            cnt += 1
                     recibos = cnt
                 except Exception:
                     recibos = None
+
             edata = await n8n_api_get(f"/executions?workflowId={CONCILIAR_WF_ID}&status=error&limit=3")
-            errs = len(edata.get("data") or [])
-            txt = f"Conciliacion WhatsApp: {estado}. "
-            if recibos is not None:
-                txt += f"Recibos leidos (ult. 40 min): {recibos}. "
-            txt += f"Errores recientes: {errs}."
-            payload = {"estado": estado, "corriendo": corriendo, "recibos_leidos_40min": recibos, "errores_recientes": errs}
+            errs_recientes = [e for e in (edata.get("data") or []) if _mins_ago(e) <= 45]
+            errs = len(errs_recientes)
+
+            # Veredicto claro para el usuario
+            if corriendo:
+                estado = "CORRIENDO (procesando recibos en segundo plano)"
+                verdict = f"En curso. Conciliadas hasta ahora: {conciliadas_total}. Segui consultando cada ~30s."
+            elif ultima_out is None:
+                estado = "SIN RESULTADO LEGIBLE"
+                verdict = "No pude leer el resultado de la ultima corrida. Revisa con obtener_ejecucion."
+            elif incompleto:
+                estado = "PROCESANDO EN TANDAS (auto-continuacion)"
+                verdict = (f"Aun no termina: se re-dispara sola. Conciliadas hasta ahora: {conciliadas_total}, "
+                           f"faltan ~{ultima_out.get('pendientes_sin_procesar', '?')}. Consulta de nuevo en ~1 min.")
+            else:
+                estado = "COMPLETO"
+                verdict = (f"Conciliacion TERMINADA. Conciliadas por WhatsApp: {conciliadas_total}. "
+                           f"Quedan {a_revisar} para revision manual (sin recibo claro / dobles ambiguas). "
+                           f"El paso4 y Recibos_Leidos.xlsx ya estan en OUTPUTS.")
+
+            payload = {
+                "estado": estado,
+                "corriendo": corriendo,
+                "completo": (incompleto is False) and (not corriendo),
+                "conciliadas_total": conciliadas_total,
+                "para_revision_manual": a_revisar,
+                "errores_recientes": errs,
+                "lecturas_nuevas_gemini_40min": recibos,  # informativo, NO es el total conciliado
+            }
+            txt = (f"Conciliacion WhatsApp: {estado}.\n{verdict}\n"
+                   f"(nota: 'lecturas nuevas de Gemini'={recibos} es solo cuantos recibos se leyeron fresco; "
+                   f"si es 0 puede ser por cache, NO significa 0 conciliadas).")
             return [TextContent(type="text", text=txt + "\n" + json.dumps(payload, ensure_ascii=False))]
         if name == "listar_workflows":
             data = await n8n_api_get("/workflows?limit=200")
