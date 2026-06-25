@@ -265,7 +265,7 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
 
             # Cadena del dia = ejecuciones terminadas en las ultimas 2 horas (cubre dias con muchas tandas en API gratis)
             chain = [e for e in cex if e.get("status") in ("success", "error") and _mins_ago(e) <= 120]
-            conciliadas_total = 0          # suma de 'escritas' de la cadena (acumulado del dia)
+            conciliadas_total = 0          # = 'escritas' de la ULTIMA tanda (ya es acumulado de la corrida; NO sumar)
             a_revisar = None               # pendientes sin resolver en la ultima tanda
             incompleto = None              # ¿quedo trabajo pendiente?
             ultima_out = None
@@ -277,11 +277,14 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
                     out = None
                 if not out:
                     continue
-                conciliadas_total += int(out.get("escritas") or 0)
                 if ultima_out is None:  # chain viene ordenada de mas reciente a mas vieja
                     ultima_out = out
                     a_revisar = out.get("a_revisar")
                     incompleto = bool(out.get("incompleto"))
+                    # 'escritas' YA es el acumulado de TODA la corrida (crece por tanda: 2,5,...,37).
+                    # Tomar el valor de la tanda MAS RECIENTE; NUNCA sumar (sumar daba 218 en vez de 37 real).
+                    conciliadas_total = int(out.get("escritas") or 0)
+                    break
 
             # Recibos nuevos leidos por Gemini en la ventana (NO es el total conciliado)
             recibos = None
