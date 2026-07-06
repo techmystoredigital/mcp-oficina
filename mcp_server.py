@@ -62,6 +62,9 @@ OP_N8N_BASE = os.environ.get("OP_N8N_BASE", "https://n8n.yoanyandres.one").rstri
 OP_N8N_KEY = os.environ.get("OP_N8N_KEY", "")
 VISION_WF_ID = os.environ.get("VISION_WF_ID", "EOawUwsoGf94R3OE")
 CONCILIAR_WF_ID = os.environ.get("CONCILIAR_WF_ID", "M98V0iDysrLyhFfL")
+MASTER_WF_ID = os.environ.get("MASTER_WF_ID", "AmDZWmlbTrTIDCUQ")  # Conciliacion_MASTER (Grecia) — para resultado_procesar
+SCRIPT1_WF_ID = os.environ.get("SCRIPT1_WF_ID", "YoPXdHOs5rJVYNsc")  # Script 1 recargas (Grecia)
+SCRIPT2_WF_ID = os.environ.get("SCRIPT2_WF_ID", "Xu9MXh1tdsQPRkzm")  # Script 2 bancos (Grecia)
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_AUTH_PASSWORD = os.environ.get("MCP_AUTH_PASSWORD", "")
 MCP_PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
@@ -133,7 +136,7 @@ async def list_tools() -> list[Tool]:
              description="Lee las cajas Virtualsoft y el Yopago SIN procesar nada. Devuelve: fechas detectadas en las cajas (con cantidad y monto), fechas_sugeridas (nuevas, posteriores a la ultima del Yopago), fechas_ya_procesadas, ultima_fecha_yopago y dia_actual. Usar SIEMPRE antes de procesar para mostrar a Grecia que fechas se procesarian y que ella confirme.",
              inputSchema={"type": "object", "properties": {}, "required": []}),
         Tool(name="procesar_dia",
-             description="Dispara MASTER (Scripts 1+2+3). Tarda 1-3 min. Genera paso1/2/3 en OUTPUTS. Parametro opcional fechas_a_procesar (lista YYYY-MM-DD): si se pasa, procesa SOLO esas fechas (control manual); si se omite, procesa automaticamente todas las posteriores a la ultima fecha del Yopago.",
+             description="FLUJO 1 (ordenar datos). Dispara MASTER (Scripts 1 y 2): Script 1 ordena las recargas nuevas en el Yopago; Script 2 prepara los bancos (incluye 'forus' como Valles de lirio). Ya NO concilia por Excel (Script 3 descartado 2026-07): la conciliacion real la hace el FLUJO 2 (conciliar_whatsapp) leyendo los recibos. Genera paso1 y paso2 en OUTPUTS y deja el Yopago listo para el Flujo 2. Tarda 1-3 min y responde al instante (corre en segundo plano). IMPORTANTE: cuando termine, consultar SIEMPRE 'resultado_procesar' para confirmar que Script 1 y 2 terminaron OK; si algun archivo fallo (formato malo, carpeta vacia, duplicado, etc.), 'resultado_procesar' trae el detalle para avisarle a la encargada QUE archivo revisar. Parametro opcional fechas_a_procesar (lista YYYY-MM-DD): si se pasa, procesa SOLO esas fechas (control manual); si se omite, procesa automaticamente todas las posteriores a la ultima fecha del Yopago.",
              inputSchema={"type": "object", "properties": {
                  "fechas_a_procesar": {"type": "array", "items": {"type": "string"},
                      "description": "Lista de fechas YYYY-MM-DD a procesar. Opcional; omitir = modo automatico."}}, "required": []}),
@@ -142,7 +145,7 @@ async def list_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": {
                  "chat_data": {"type": "array", "items": {"type": "object"}}}}),
         Tool(name="ejecutar_script",
-             description="Dispara Script 1, 2 o 3 individualmente.",
+             description="Dispara Script 1 o 2 individualmente (debug/pruebas). NOTA: el Script 3 (conciliacion por Excel) fue descartado 2026-07 y esta DESACTIVADO; no usarlo. Para el dia normal usar procesar_dia (que corre 1 y 2 en orden).",
              inputSchema={"type": "object", "properties": {
                  "script": {"type": "integer", "enum": [1, 2, 3]}}, "required": ["script"]}),
         Tool(name="procesar_chat_ia",
@@ -156,12 +159,15 @@ async def list_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": {
                  "chat_data": {"type": "array", "items": {"type": "object"}}}, "required": ["chat_data"]}),
         Tool(name="conciliar_whatsapp",
-             description="2da automatizacion: concilia por WhatsApp. Lee el puntero del ultimo run de Scripts (_ultimo_run.json), baja el paso3, captura el chat de WhatsApp UNA vez (/api/state), lee los recibos con Vision (Gemini) y genera 'paso4_whatsapp' (Yopago final conciliado) en la carpeta del dia. Correr DESPUES de procesar_dia. Tarda 1-3 min. Solo llena con certeza (regla de oro); lo dudoso queda en blanco y se reporta.",
+             description="FLUJO 2 (conciliacion real). Concilia por WhatsApp. Lee el puntero del ultimo run del Flujo 1 (archivo puntero en Drive), baja el paso1 (Yopago ordenado), captura el chat de WhatsApp UNA vez (/api/state), lee los recibos con Vision (Gemini) y genera 'paso4_whatsapp' (Yopago final conciliado) en la carpeta del dia. Correr DESPUES de procesar_dia (y de confirmar con resultado_procesar que el Flujo 1 termino OK). Tarda 1-3 min. Solo llena con certeza (regla de oro); lo dudoso queda en blanco y se reporta.",
              inputSchema={"type": "object", "properties": {
                  "fechas": {"type": "array", "items": {"type": "string"},
                      "description": "Opcional: lista de fechas YYYY-MM-DD a conciliar. Omitir = todas las pendientes del paso3."}}, "required": []}),
         Tool(name="progreso_whatsapp",
              description="Consulta el RESULTADO REAL de la conciliacion WhatsApp. Devuelve: estado (CORRIENDO / PROCESANDO EN TANDAS / COMPLETO), conciliadas_total (recargas efectivamente conciliadas, ACUMULADO del dia), para_revision_manual (las que quedan sin recibo claro), completo (true/false) y un veredicto en texto. Usar DESPUES de conciliar_whatsapp, cada ~30-60s, hasta que 'completo'=true. IMPORTANTE: para reportar al usuario usa SIEMPRE 'conciliadas_total' y 'para_revision_manual'. El campo 'lecturas_nuevas_gemini_40min' es informativo y puede ser 0 por cache; NO significa que se conciliaron 0 recargas.",
+             inputSchema={"type": "object", "properties": {}, "required": []}),
+        Tool(name="resultado_procesar",
+             description="Consulta el RESULTADO del FLUJO 1 (procesar_dia). Usar DESPUES de procesar_dia (esperar ~1-3 min o consultar hasta que estado != CORRIENDO). Devuelve: estado (CORRIENDO / OK / ERROR_EN_ALGUN_SCRIPT), script1 y script2 (status ok/error + el mensaje de error con la ACCION a tomar si fallo), paso1/paso2 generados, inputs_conservados (true si hubo error: los archivos NO se borraron, la encargada corrige y re-dispara), fecha/hora de la corrida, y un veredicto en texto. SI hay error: el mensaje trae el detalle exacto (archivo con formato malo, carpeta vacia, acumulado faltante, duplicado, etc.) — explicarselo a la encargada en criollo y decirle QUE archivo del Drive revisar/re-subir. NO reprocesar hasta que ella corrija.",
              inputSchema={"type": "object", "properties": {}, "required": []}),
         Tool(name="listar_workflows",
              description="Lista todos los workflows de N8N.",
@@ -209,7 +215,7 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
                 body["fechas_a_procesar"] = fechas
             r = await n8n_webhook("exec-master-procesar", body)
             extra = f" (fechas elegidas: {', '.join(fechas)})" if fechas else " (modo automatico: posteriores a la ultima del Yopago)"
-            return [TextContent(type="text", text=f"MASTER disparado{extra}.\n{r}\n\nVerifica OUTPUTS en 2-5 min.")]
+            return [TextContent(type="text", text=f"FLUJO 1 (Scripts 1 y 2) disparado{extra}. Corre en segundo plano ~1-3 min.\n{r}\n\nSIGUIENTE PASO OBLIGATORIO: en ~1-3 min consulta 'resultado_procesar' para confirmar que Script 1 y 2 terminaron OK. Si algun archivo fallo, ese tool trae el detalle para avisarle a la encargada QUE revisar (los inputs NO se borran si hubo error). Solo cuando el Flujo 1 este OK, corre 'conciliar_whatsapp'.")]
         if name == "cerrar_dia":
             body = {"chat_data": arguments["chat_data"]} if arguments.get("chat_data") else {}
             return [TextContent(type="text", text=f"Workflow D disparado.\n{await n8n_webhook('exec-script4', body)}")]
@@ -231,6 +237,147 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
                 body["fechas"] = arguments["fechas"]
             r = await n8n_webhook("conciliar-whatsapp", body)
             return [TextContent(type="text", text="Conciliacion WhatsApp INICIADA en segundo plano. Consulta 'progreso_whatsapp' cada ~30s para ver el avance (recibos leidos / estado / errores). El paso4 y Recibos_Leidos.xlsx quedan en OUTPUTS al terminar.\n" + r)]
+        if name == "resultado_procesar":
+            import datetime as _dt
+
+            def _node_json(runData: dict, node: str):
+                """Ultimo json de salida de un nodo (o None)."""
+                try:
+                    arr = runData.get(node) or []
+                    return arr[-1]["data"]["main"][0][0]["json"]
+                except Exception:
+                    return None
+
+            def _node_error(runData: dict, node: str):
+                """Mensaje de error crudo de un nodo (si el nodo fallo), o None."""
+                try:
+                    arr = runData.get(node) or []
+                    e = arr[-1].get("error") or {}
+                    m = e.get("message") or (e.get("cause") or {}).get("message")
+                    return str(m) if m else None
+                except Exception:
+                    return None
+
+            now = _dt.datetime.now(_dt.timezone.utc)
+
+            def _mins_ago(t):
+                if not t:
+                    return 9999
+                try:
+                    return (now - _dt.datetime.fromisoformat(str(t).replace("Z", "+00:00"))).total_seconds() / 60.0
+                except Exception:
+                    return 9999
+
+            mdata = await n8n_api_get(f"/executions?workflowId={MASTER_WF_ID}&limit=5")
+            mex = mdata.get("data") or []
+            if not mex:
+                return [TextContent(type="text", text=json.dumps({
+                    "estado": "SIN_CORRIDAS",
+                    "veredicto": "No encontre ninguna ejecucion del Flujo 1 (Master). Dispara procesar_dia primero."}, ensure_ascii=False))]
+            last = mex[0]
+            corriendo = (last.get("status") == "running") or (not last.get("stoppedAt"))
+            if corriendo:
+                return [TextContent(type="text", text=json.dumps({
+                    "estado": "CORRIENDO",
+                    "iniciado": last.get("startedAt"),
+                    "veredicto": "El Flujo 1 todavia esta corriendo. Consulta de nuevo en ~1 min."}, ensure_ascii=False))]
+
+            full = await n8n_api_get(f"/executions/{last.get('id')}?includeData=true")
+            rd = (full.get("data") or {}).get("resultData") or {}
+            runData = rd.get("runData") or {}
+            resumen_node = _node_json(runData, "Capturar resultado 3 + resumen") or {}
+            master_start = last.get("startedAt")
+
+            async def _error_subworkflow(wf_id):
+                """Mensaje de error de la ejecucion fallida mas reciente de un sub-script (S1/S2) de ESTA corrida.
+                Cubre el caso en que el Master se traga el throw (salida vacia) pero el sub-workflow SI registro
+                su propio error (saveDataErrorExecution=all) con el [TAG] + ACCION completos."""
+                try:
+                    ed = await n8n_api_get(f"/executions?workflowId={wf_id}&status=error&limit=3")
+                    for e in (ed.get("data") or []):
+                        # correlacion temporal: el error del sub-script debe ser >= inicio del Master (misma corrida)
+                        if master_start and e.get("startedAt") and str(e.get("startedAt")) >= str(master_start):
+                            fx = await n8n_api_get(f"/executions/{e.get('id')}?includeData=true")
+                            m = ((fx.get("data") or {}).get("resultData") or {}).get("error") or {}
+                            msg = m.get("message") or (m.get("cause") or {}).get("message")
+                            if msg:
+                                return str(msg)
+                    return None
+                except Exception:
+                    return None
+
+            async def _enriquecer(err_key, nodo_llamada, sub_wf):
+                """Devuelve el mensaje de error mas rico disponible para un script (prefiere el que trae [TAG])."""
+                msg = resumen_node.get(err_key)
+                rico = _node_error(runData, nodo_llamada)  # throw crudo en el nodo del Master
+                out = _node_json(runData, nodo_llamada) or {}
+                rico2 = None
+                if isinstance(out, dict):
+                    rico2 = (out.get("error") or {}).get("message") if isinstance(out.get("error"), dict) else out.get("error")
+                sub = await _error_subworkflow(sub_wf)  # el error propio del sub-workflow (mas confiable)
+                for cand in (sub, rico, rico2, msg):
+                    if cand and "[" in str(cand):
+                        return str(cand)
+                return str(sub or rico or rico2 or msg or "Error sin detalle: revisar la ejecucion con obtener_ejecucion.")
+
+            s1_status = resumen_node.get("script1_status")
+            s2_status = resumen_node.get("script2_status")
+            master_status = resumen_node.get("master_status")
+            top_error = (rd.get("error") or {}).get("message") if rd.get("error") else None
+
+            script1 = {"status": s1_status, "paso1": resumen_node.get("script1_paso1_name")}
+            script2 = {"status": s2_status, "paso2": resumen_node.get("script2_paso2_name")}
+            hubo_error = (s1_status == "error") or (s2_status == "error") or (last.get("status") == "error")
+            if s1_status == "error":
+                script1["error"] = await _enriquecer("script1_error", "Llamar Script 1", SCRIPT1_WF_ID)
+            if s2_status == "error":
+                script2["error"] = await _enriquecer("script2_error", "Llamar Script 2", SCRIPT2_WF_ID)
+
+            if not resumen_node:
+                # La corrida no llego a armar el resumen final: fallo de sistema, throw de un script,
+                # o corrida incompleta (ej. Script 1 no devolvio recargas). NO reportar OK.
+                last_node = rd.get("lastNodeExecuted")
+                rico = (_node_error(runData, "Llamar Script 2") or _node_error(runData, "Llamar Script 1")
+                        or await _error_subworkflow(SCRIPT2_WF_ID) or await _error_subworkflow(SCRIPT1_WF_ID))
+                if last.get("status") == "error" or top_error or rico:
+                    detalle = rico or top_error or "sin detalle"
+                    veredicto = (f"El Flujo 1 NO termino bien (se detuvo en '{last_node}'): {detalle} "
+                                 f"Los inputs NO se borraron: la encargada corrige lo indicado en el Drive y vuelve a disparar procesar_dia. "
+                                 f"NO correr conciliar_whatsapp. Detalle completo: obtener_ejecucion id={last.get('id')}.")
+                    estado = "ERROR_EN_ALGUN_SCRIPT"
+                    hubo_error = True
+                else:
+                    veredicto = (f"No pude confirmar el resultado con certeza: la corrida termino como '{last.get('status')}' pero no genero "
+                                 f"el resumen final (ultimo nodo ejecutado: {last_node}). Causa probable: Script 1 no encontro recargas nuevas "
+                                 f"(re-disparo del mismo dia / cajas ya procesadas) o la corrida se interrumpio. Revisar con obtener_ejecucion "
+                                 f"id={last.get('id')} ANTES de continuar; no asumir que quedo OK.")
+                    estado = "INDETERMINADO"
+            elif hubo_error:
+                partes = []
+                if s1_status == "error":
+                    partes.append(f"Script 1 (recargas): {script1.get('error')}")
+                if s2_status == "error":
+                    partes.append(f"Script 2 (bancos): {script2.get('error')}")
+                veredicto = ("El Flujo 1 NO termino bien. " + " | ".join(partes) +
+                             " Los archivos de input NO se borraron: la encargada corrige lo indicado en el Drive y vuelve a disparar procesar_dia. NO correr conciliar_whatsapp todavia.")
+                estado = "ERROR_EN_ALGUN_SCRIPT"
+            else:
+                veredicto = (f"Flujo 1 OK. Script 1 y 2 terminaron bien; el Yopago quedo ordenado (paso1={script1.get('paso1')}). "
+                             "Ya se puede correr conciliar_whatsapp (Flujo 2).")
+                estado = "OK"
+
+            return [TextContent(type="text", text=json.dumps({
+                "estado": estado,
+                "master_status": master_status,
+                "script1": script1,
+                "script2": script2,
+                "inputs_conservados": bool(hubo_error),
+                "corrida_id": last.get("id"),
+                "iniciado": last.get("startedAt"),
+                "resumen_interno": resumen_node.get("resumen"),
+                "veredicto": veredicto,
+            }, ensure_ascii=False))]
+
         if name == "progreso_whatsapp":
             import datetime as _dt
 
