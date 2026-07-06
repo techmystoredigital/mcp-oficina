@@ -167,8 +167,10 @@ async def list_tools() -> list[Tool]:
              description="Consulta el RESULTADO REAL de la conciliacion WhatsApp. Devuelve: estado (CORRIENDO / PROCESANDO EN TANDAS / COMPLETO), conciliadas_total (recargas efectivamente conciliadas, ACUMULADO del dia), para_revision_manual (las que quedan sin recibo claro), completo (true/false) y un veredicto en texto. Usar DESPUES de conciliar_whatsapp, cada ~30-60s, hasta que 'completo'=true. IMPORTANTE: para reportar al usuario usa SIEMPRE 'conciliadas_total' y 'para_revision_manual'. El campo 'lecturas_nuevas_gemini_40min' es informativo y puede ser 0 por cache; NO significa que se conciliaron 0 recargas.",
              inputSchema={"type": "object", "properties": {}, "required": []}),
         Tool(name="resultado_procesar",
-             description="Consulta el RESULTADO del FLUJO 1 (procesar_dia). Usar DESPUES de procesar_dia (esperar ~1-3 min o consultar hasta que estado != CORRIENDO). Devuelve: estado (CORRIENDO / OK / ERROR_EN_ALGUN_SCRIPT), script1 y script2 (status ok/error + el mensaje de error con la ACCION a tomar si fallo), paso1/paso2 generados, inputs_conservados (true si hubo error: los archivos NO se borraron, la encargada corrige y re-dispara), fecha/hora de la corrida, y un veredicto en texto. SI hay error: el mensaje trae el detalle exacto (archivo con formato malo, carpeta vacia, acumulado faltante, duplicado, etc.) — explicarselo a la encargada en criollo y decirle QUE archivo del Drive revisar/re-subir. NO reprocesar hasta que ella corrija.",
-             inputSchema={"type": "object", "properties": {}, "required": []}),
+             description="Consulta el RESULTADO del FLUJO 1 (procesar_dia). Llamalo UNA vez apenas dispares procesar_dia: por defecto ESPERA SOLO a que la corrida termine (~1-3 min) y devuelve el resultado final — NO tenes que re-preguntar ni pedirle al usuario que espere. Devuelve: estado (OK / ERROR_EN_ALGUN_SCRIPT / INDETERMINADO / ERROR_SISTEMA; CORRIENDO solo si excede el tiempo), script1 y script2 (status ok/error + el mensaje de error con la ACCION si fallo), paso1/paso2 generados, inputs_conservados (true si hubo error: los archivos NO se borraron), fecha/hora, y un veredicto en texto. SI hay error: el mensaje trae el detalle exacto (formato malo, carpeta vacia, acumulado faltante, duplicado, forus, etc.) — explicaselo a la encargada en criollo y deci QUE archivo del Drive revisar/re-subir. NO reprocesar hasta que ella corrija. Si devuelve CORRIENDO (raro), volve a llamarlo vos mismo en ~1 min (sin molestar al usuario).",
+             inputSchema={"type": "object", "properties": {
+                 "esperar": {"type": "boolean", "default": True,
+                     "description": "Si true (default), espera internamente a que el Flujo 1 termine y devuelve el resultado final. Pasar false solo para un chequeo instantaneo sin esperar."}}, "required": []}),
         Tool(name="listar_workflows",
              description="Lista todos los workflows de N8N.",
              inputSchema={"type": "object", "properties": {
@@ -215,7 +217,7 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
                 body["fechas_a_procesar"] = fechas
             r = await n8n_webhook("exec-master-procesar", body)
             extra = f" (fechas elegidas: {', '.join(fechas)})" if fechas else " (modo automatico: posteriores a la ultima del Yopago)"
-            return [TextContent(type="text", text=f"FLUJO 1 (Scripts 1 y 2) disparado{extra}. Corre en segundo plano ~1-3 min.\n{r}\n\nSIGUIENTE PASO OBLIGATORIO: en ~1-3 min consulta 'resultado_procesar' para confirmar que Script 1 y 2 terminaron OK. Si algun archivo fallo, ese tool trae el detalle para avisarle a la encargada QUE revisar (los inputs NO se borran si hubo error). Solo cuando el Flujo 1 este OK, corre 'conciliar_whatsapp'.")]
+            return [TextContent(type="text", text=f"FLUJO 1 (Scripts 1 y 2) disparado{extra}. Corre en segundo plano ~1-3 min.\n{r}\n\nSIGUIENTE PASO OBLIGATORIO: llama YA a 'resultado_procesar' — espera solo hasta que termine y te da el resultado final (NO le pidas al usuario que espere ni que te avise, vos hacés el seguimiento). Si da OK, reporta el resumen. Si da error, avisale a la encargada QUE archivo revisar (los inputs NO se borran). Solo cuando el Flujo 1 este OK, ofrece/corre 'conciliar_whatsapp'.")]
         if name == "cerrar_dia":
             body = {"chat_data": arguments["chat_data"]} if arguments.get("chat_data") else {}
             return [TextContent(type="text", text=f"Workflow D disparado.\n{await n8n_webhook('exec-script4', body)}")]
@@ -275,12 +277,28 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
                     "estado": "SIN_CORRIDAS",
                     "veredicto": "No encontre ninguna ejecucion del Flujo 1 (Master). Dispara procesar_dia primero."}, ensure_ascii=False))]
             last = mex[0]
-            corriendo = (last.get("status") == "running") or (not last.get("stoppedAt"))
-            if corriendo:
+            esperar = arguments.get("esperar", True)
+
+            def _corriendo(e):
+                return (e.get("status") == "running") or (not e.get("stoppedAt"))
+
+            # PROGRESION AUTOMATICA: si el Flujo 1 sigue corriendo, esperamos INTERNAMENTE a que termine
+            # (tarda ~1-3 min) y devolvemos el resultado final en ESTA misma llamada. Asi el agente NO
+            # tiene que re-preguntar ni pedirle al usuario que espere: una sola llamada -> resultado.
+            if _corriendo(last) and esperar:
+                _t0 = time.time()
+                while time.time() - _t0 < 200:   # tope bajo el read-timeout de httpx (300s)
+                    await asyncio.sleep(8)
+                    _d = (await n8n_api_get(f"/executions?workflowId={MASTER_WF_ID}&limit=1")).get("data") or []
+                    if _d:
+                        last = _d[0]
+                        if not _corriendo(last):
+                            break
+            if _corriendo(last):
                 return [TextContent(type="text", text=json.dumps({
                     "estado": "CORRIENDO",
                     "iniciado": last.get("startedAt"),
-                    "veredicto": "El Flujo 1 todavia esta corriendo. Consulta de nuevo en ~1 min."}, ensure_ascii=False))]
+                    "veredicto": "El Flujo 1 tardo mas de lo normal y sigue corriendo. Volve a consultar resultado_procesar en ~1 min (no hace falta avisarle al usuario)."}, ensure_ascii=False))]
 
             full = await n8n_api_get(f"/executions/{last.get('id')}?includeData=true")
             rd = (full.get("data") or {}).get("resultData") or {}
