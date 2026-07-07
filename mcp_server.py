@@ -65,6 +65,9 @@ CONCILIAR_WF_ID = os.environ.get("CONCILIAR_WF_ID", "M98V0iDysrLyhFfL")
 MASTER_WF_ID = os.environ.get("MASTER_WF_ID", "AmDZWmlbTrTIDCUQ")  # Conciliacion_MASTER (Grecia) — para resultado_procesar
 SCRIPT1_WF_ID = os.environ.get("SCRIPT1_WF_ID", "YoPXdHOs5rJVYNsc")  # Script 1 recargas (Grecia)
 SCRIPT2_WF_ID = os.environ.get("SCRIPT2_WF_ID", "Xu9MXh1tdsQPRkzm")  # Script 2 bancos (Grecia)
+# OpenRouter (vision PAGA): para el tool saldo_openrouter (alerta si falta credito para procesar a maxima velocidad)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_ALERT_USD = float(os.environ.get("OPENROUTER_ALERT_USD", "3"))   # avisar si el saldo baja de esto
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
 MCP_AUTH_PASSWORD = os.environ.get("MCP_AUTH_PASSWORD", "")
 MCP_PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
@@ -171,6 +174,9 @@ async def list_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": {
                  "esperar": {"type": "boolean", "default": True,
                      "description": "Si true (default), espera internamente a que el Flujo 1 termine y devuelve el resultado final. Pasar false solo para un chequeo instantaneo sin esperar."}}, "required": []}),
+        Tool(name="saldo_openrouter",
+             description="Consulta el SALDO de OpenRouter (la API de vision PAGA que usa la conciliacion a maxima velocidad). Devuelve credito total, usado, saldo restante (USD) y una ALERTA si el saldo esta bajo (por debajo del umbral). Usar para avisar al jefe/encargada si hace falta recargar credito ANTES de procesar un dia con muchos recibos. Consultar al inicio del dia o si progreso_whatsapp se frena por falta de credito.",
+             inputSchema={"type": "object", "properties": {}, "required": []}),
         Tool(name="listar_workflows",
              description="Lista todos los workflows de N8N.",
              inputSchema={"type": "object", "properties": {
@@ -234,11 +240,36 @@ async def call_tool(name: str, arguments: dict | None = None) -> list[TextConten
             return [TextContent(type="text", text=await n8n_webhook("exec-conciliacion-telegram",
                                                                       {"chat_data": arguments["chat_data"]}))]
         if name == "conciliar_whatsapp":
-            body = {}
+            # MAXIMA VELOCIDAD por defecto: vision PAGA (OpenRouter) + pre-carga paralela agresiva + tanda larga + tope de credito.
+            # Requiere N8N_RUNNERS_TASK_TIMEOUT>=1500 (ya configurado). El cap max_imagenes=500 protege el gasto.
+            body = {
+                "vision_provider": os.environ.get("CONCILIAR_VISION_PROVIDER", "paga"),
+                "rate_limit_min": int(os.environ.get("CONCILIAR_RATE_MIN", "300")),
+                "deadline_ms": int(os.environ.get("CONCILIAR_DEADLINE_MS", "1200000")),
+                "warm_max_conc": int(os.environ.get("CONCILIAR_MAX_CONC", "28")),
+                "max_imagenes": int(os.environ.get("CONCILIAR_MAX_IMAGENES", "500")),
+            }
             if arguments.get("fechas"):
                 body["fechas"] = arguments["fechas"]
             r = await n8n_webhook("conciliar-whatsapp", body)
-            return [TextContent(type="text", text="Conciliacion WhatsApp INICIADA en segundo plano. Consulta 'progreso_whatsapp' cada ~30s para ver el avance (recibos leidos / estado / errores). El paso4 y Recibos_Leidos.xlsx quedan en OUTPUTS al terminar.\n" + r)]
+            return [TextContent(type="text", text="Conciliacion WhatsApp INICIADA en segundo plano a MAXIMA VELOCIDAD (vision paga + paralelo). Consulta 'progreso_whatsapp' cada ~30s para ver el avance (conciliadas / estado / errores). El paso4 y Recibos_Leidos.xlsx quedan en OUTPUTS al terminar. Tip: corre 'saldo_openrouter' de vez en cuando para asegurar que hay credito para procesar a maxima velocidad.\n" + r)]
+        if name == "saldo_openrouter":
+            if not OPENROUTER_API_KEY:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": "Falta OPENROUTER_API_KEY en el entorno del MCP. Agregala (y de paso rota la key de OpenRouter) en EasyPanel para poder consultar el saldo."}, ensure_ascii=False))]
+            try:
+                async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, verify=True) as c:
+                    r = await c.get("https://openrouter.ai/api/v1/credits", headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
+                    r.raise_for_status()
+                    d = (r.json() or {}).get("data") or {}
+                tot = float(d.get("total_credits") or 0); usado = float(d.get("total_usage") or 0); saldo = round(tot - usado, 2)
+                bajo = saldo < OPENROUTER_ALERT_USD
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": True, "credito_total_usd": round(tot, 2), "usado_usd": round(usado, 2), "saldo_restante_usd": saldo,
+                    "umbral_alerta_usd": OPENROUTER_ALERT_USD, "saldo_bajo": bajo,
+                    "veredicto": (f"ALERTA SALDO BAJO: quedan ${saldo} en OpenRouter (umbral ${OPENROUTER_ALERT_USD}). Avisar al jefe para RECARGAR y no frenar la conciliacion a maxima velocidad." if bajo else f"Saldo OK: ${saldo} disponibles en OpenRouter para procesar a maxima velocidad."),
+                }, ensure_ascii=False))]
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"ok": False, "error": f"No pude leer el saldo de OpenRouter: {str(e)[:150]}"}, ensure_ascii=False))]
         if name == "resultado_procesar":
             import datetime as _dt
 
